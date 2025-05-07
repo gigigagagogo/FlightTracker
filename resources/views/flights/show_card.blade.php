@@ -14,14 +14,17 @@
     <div class="card shadow-sm p-4 mb-4">
         <div class="row align-items-center">
             <div class="col-md-4 text-center">
-                <img src="/{{ $flight->airplaneModel->image_path }}" alt="{{ $flight->airplaneModel->name }}" class="airplane-image mb-3">
+                <img src="/{{ $flight->airplaneModel->image_path }}" alt="{{ $flight->airplaneModel->name }}"
+                     class="airplane-image mb-3">
                 <h5>{{ $flight->airplaneModel->name }}</h5>
             </div>
 
             <div class="col-md-8">
                 <div class="info-block mb-3">
-                    <strong>Partenza:</strong> {{ $flight->departureAirport->city }} – {{ \Carbon\Carbon::parse($flight->departure_time)->format('d/m/Y H:i') }}<br>
-                    <strong>Arrivo:</strong> {{ $flight->arrivalAirport->city }} – {{ \Carbon\Carbon::parse($flight->arrival_time)->format('d/m/Y H:i') }}
+                    <strong>Partenza:</strong> {{ $flight->departureAirport->city }}
+                    – {{ \Carbon\Carbon::parse($flight->departure_time)->format('d/m/Y H:i') }}<br>
+                    <strong>Arrivo:</strong> {{ $flight->arrivalAirport->city }}
+                    – {{ \Carbon\Carbon::parse($flight->arrival_time)->format('d/m/Y H:i') }}
                 </div>
 
                 <div class="info-block mb-2">
@@ -40,11 +43,56 @@
 
 <script>
     let map;
-    let marker;
+    /** @type {google.maps.OverlayView} */
+    let overlay;
+    let updates = -1;
 
-    function initMap() {
+    async function initMap() {
+
+        class RotatableOverlay extends google.maps.OverlayView {
+            constructor(position, imageUrl, angle) {
+                super();
+                this.position = position;
+                this.imageUrl = imageUrl;
+                this.angle = angle;
+                this.div = null;
+            }
+
+            onAdd() {
+                this.div = document.createElement('div');
+                this.div.style.position = 'absolute';
+                this.div.style.zIndex = '-1';
+                this.div.innerHTML = `<img src="${this.imageUrl}" style="transform: rotate(${this.angle}deg); width:40px;" alt="plane">`;
+
+                /** @type {google.maps.MapPanes} */
+                const panes = this.getPanes();
+                panes.overlayImage.appendChild(this.div);
+            }
+
+            draw() {
+                const point = this.getProjection().fromLatLngToDivPixel(this.position);
+                if (point && this.div) {
+                    this.div.style.left = (point.x - 20) + 'px';
+                    this.div.style.top = (point.y - 20) + 'px';
+                }
+            }
+
+            onRemove() {
+                if (this.div) {
+                    this.div.remove();
+                    this.div = null;
+                }
+            }
+
+            setPosition(position) {
+                this.position = position;
+                this.draw();
+            }
+
+        }
+
         // Posizione iniziale temporanea
-        const iniziale = { lat: 0, lng: 0 };
+        const iniziale = new google.maps.LatLng(0, 0);
 
         // Crea mappa
         map = new google.maps.Map(document.getElementById("map"), {
@@ -52,87 +100,94 @@
             center: iniziale,
         });
 
-        // Crea marker
-        marker = new google.maps.Marker({
-            position: iniziale,
-            map: map,
-            title: "Aereo",
-            icon: {
-                url: "/images/icon.svg",
-                scaledSize: new google.maps.Size(40, 40),
-                anchor: new google.maps.Point(25, 25)
-            }
+        const start_latitude = {{ $flight->departureAirport->latitude }};
+        const start_longitude = {{ $flight->departureAirport->longitude }};
+        const end_latitude = {{ $flight->arrivalAirport->latitude }};
+        const end_longitude = {{ $flight->arrivalAirport->longitude }};
+
+        let startPoint = new google.maps.LatLng(start_latitude, start_longitude);
+        let endPoint = new google.maps.LatLng(end_latitude, end_longitude);
+
+
+        const {spherical} = await google.maps.importLibrary("geometry");
+
+        // Calcolo dell'angolo di direzione
+        const heading = spherical.computeHeading(startPoint, endPoint);
+        // Adatto l'angolo all'icona dell'aereo
+        const iconHeading = -45 + heading
+
+        // Creo overlay dell'aereo
+        overlay = new RotatableOverlay(
+            iniziale,
+            '/images/plane-map-icon.svg',
+            iconHeading
+        );
+
+        overlay.setMap(map);
+
+        // Disegno la rotta
+        const partenza = new google.maps.LatLng({{ $flight->departureAirport->latitude }}, {{ $flight->departureAirport->longitude }});
+        const arrivo = new google.maps.LatLng({{ $flight->arrivalAirport->latitude }}, {{ $flight->arrivalAirport->longitude }});
+
+        new google.maps.Polyline({
+            path: [partenza, arrivo],
+            geodesic: false,
+            strokeColor: "#000",
+            strokeOpacity: 0,
+            strokeWeight: 2,
+            zIndex: 1,
+            icons: [{
+                icon: {
+                    path: 'M 0,-1 0,1', // tratteggio
+                    strokeOpacity: 1,
+                    scale: 4
+                },
+                offset: '0',
+                repeat: '20px'
+            }],
+            map: map
         });
 
         // Avvia aggiornamenti
-        aggiornaVolo();
-        setInterval(aggiornaVolo, 10000);
+        const posizioneIniziale = await aggiornaVolo();
+        if (posizioneIniziale) {
+            map.panTo(posizioneIniziale);
+        }
+        setInterval(aggiornaVolo, 250);
     }
-    let rotta;
-    let previousPosition = null;
-    function aggiornaVolo() {
 
-        fetch("{{ url('/api/simulazione-volo/' . $flight->id) }}")
-            .then(res => res.json())
-            .then(data => {
-                const nuovaPosizione = { lat: data.lat, lng: data.lon };
+    async function aggiornaVolo() {
+        try {
+            const res = await fetch("{{ url('/api/simulazione-volo/' . $flight->id) }}");
+            const data = await res.json();
+            updates++;
+            const nuovaPosizione = new google.maps.LatLng(data.lat, data.lng);
 
-                if (previousPosition) {
-                    const angle = calcolaAngolo(previousPosition, nuovaPosizione);
-                    ruotaAereo(angle); // Ruota l'icona dell'aereo
-                }
+            overlay.setPosition(nuovaPosizione);
 
-                marker.setPosition(nuovaPosizione);
-                map.panTo(nuovaPosizione);
-
-                document.getElementById("current-coordinates").innerText =
-                    `${data.lat.toFixed(4)} / ${data.lon.toFixed(4)}`;
-
+            // Aggiorno l'immagine in diretta ma i dati solo ogni 20 tick (5s)
+            if (data.percentuale < 10 || data.percentuale > 90 || updates % 20 === 0) {
                 document.getElementById("current-speed").innerText =
-                    `${data.velocita} km/h`;
+                    `${parseInt(data.velocita)} km/h`;
+            }
 
-                if (!rotta) {
-                    const partenza = {
-                        lat: {{ $flight->departureAirport->latitude }},
-                        lng: {{ $flight->departureAirport->longitude }}
-                    };
+            if (updates % 20 === 0) {
+                document.getElementById("current-coordinates").innerText =
+                    `${nuovaPosizione.lat().toFixed(4)} / ${nuovaPosizione.lng().toFixed(4)}`;
+            }
 
-                    const arrivo = {
-                        lat: {{ $flight->arrivalAirport->latitude }},
-                        lng: {{ $flight->arrivalAirport->longitude }}
-                    };
-
-                    rotta = new google.maps.Polyline({
-                        path: [partenza, arrivo],
-                        geodesic: true,
-                        strokeColor: "#000",
-                        strokeOpacity: 0,
-                        strokeWeight: 2,
-                        icons: [{
-                            icon: {
-                                path: 'M 0,-1 0,1', // tratteggio
-                                strokeOpacity: 1,
-                                scale: 4
-                            },
-                            offset: '0',
-                            repeat: '20px'
-                        }],
-                        map: map
-                    });
-                }
-
-            })
-            .catch(err => {
-                console.error("Errore durante la richiesta:", err);
-            });
+            return nuovaPosizione;
+        } catch (err) {
+            console.error("Errore durante la richiesta:", err);
+            return null;
+        }
     }
+
 </script>
-<?php
-    $googleapi = env("GOOGLE_MAPS_API");
-    ?>
 
+<script
+    src="https://maps.googleapis.com/maps/api/js?key={{ env('GOOGLE_MAPS_API') }}&libraries=geometry&callback=initMap&loading=async"
+    async defer></script>
 
-<script src="https://maps.googleapis.com/maps/api/js?key=<?php echo $googleapi ?>&callback=initMap" async defer></script>
 </body>
 </html>
-
